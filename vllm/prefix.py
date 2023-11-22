@@ -74,10 +74,14 @@ class PrefixPool:
         self.prefixes = []
         self.prefixes_hash = {}
         self.block_size = block_size
+        
+        self.id_counter = 0
     
     def add_prefix(self, token_ids: List[int], arrival_time: float):
         # generate prefix_id
-        prefix_id = len(self.prefixes)
+        prefix_id = self.id_counter
+        self.id_counter += 1
+        
         # create a new prefix
         prefix = Prefix(prefix_id, token_ids, self.block_size, arrival_time)
         self.prefixes.append(prefix)
