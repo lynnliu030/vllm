@@ -5,6 +5,7 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 from vllm.config import CacheConfig, SchedulerConfig
 from vllm.core.block_manager import BlockSpaceManager
 from vllm.core.policy import PolicyFactory
+from vllm.core.prefix_policy import PrefixPolicyFactory
 from vllm.logger import init_logger
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceStatus)
@@ -69,6 +70,10 @@ class Scheduler:
 
         # Instantiate the scheduling policy.
         self.policy = PolicyFactory.get_policy(policy_name="fcfs")
+        
+        # Instantiate the scheduling policy for prefix.
+        self.prefix_policy = PrefixPolicyFactory.get_policy(policy_name="lru")
+        
         # Create the block space manager.
         self.block_manager = BlockSpaceManager(
             block_size=self.cache_config.block_size,
@@ -85,6 +90,9 @@ class Scheduler:
         self.running: List[SequenceGroup] = []
         # Sequence groups in the SWAPPED state.
         self.swapped: List[SequenceGroup] = []
+
+        # Prefixes 
+        self.running_prefixes: List[Prefix] = []
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
@@ -125,7 +133,12 @@ class Scheduler:
 
         # Fix the current time.
         now = time.monotonic()
-
+        self.running_prefixes = self.prefix_pool.get_gpu_prefixes()
+        sorted_prefixes = self.prefix_policy.sort_by_priority(now, self.running_prefixes)
+        
+        prefix_repres = [f"prefix id: {prefix.prefix_id}, prefix_freq: {prefix.freq}, prefix_arrival_time: {prefix.arrival_time}, prefix_last_access_time {prefix.last_accessed_time}" for prefix in sorted_prefixes]
+        print(f"Sorted prefix in order: {prefix_repres}")
+                    
         # Join waiting sequences if possible.
         if not self.swapped:
             ignored_seq_groups: List[SequenceGroup] = []
@@ -155,11 +168,17 @@ class Scheduler:
                     ignored_seq_groups.append(seq_group)
                     self.waiting.pop(0)
                     continue
-
-                # If the sequence group cannot be allocated, stop.
-                if not self.block_manager.can_allocate(seq_group):
-                    break
-
+                
+                # If the sequence group cannot be allocated, TODO: fix this; free and stop. 
+                if not self.block_manager.can_allocate(seq_group):  
+                    # preempt prefix 
+                    if len(sorted_prefixes) > 0:
+                        victim_prefix = sorted_prefixes.pop(-1)
+                        print(f"Swapping out prefix: ", victim_prefix.prefix_id)  
+                        self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
+                        self.running_prefixes.remove(victim_prefix)
+                    break 
+                
                 # If the number of batched tokens exceeds the limit, stop.
                 new_seq_lens = seq_lens + [num_prompt_tokens]
                 num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
@@ -184,6 +203,9 @@ class Scheduler:
                 if seq_group.prefix is not None and seq_group.prefix.on_cpu:
                     # prefix.on_gpu will be set inside this function
                     self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in)
+                    self.running_prefixes.append(seq_group.prefix)
+                    print(f"Blocks to swap in {blocks_to_swap_in}")
+                    
                 # if the prefix hasn't been compuated, allocate blocks for it and set prefix.swap_to_gpu to True
                 self._allocate(seq_group)
                 self.running.append(seq_group)
@@ -251,6 +273,13 @@ class Scheduler:
                     break
 
                 seq_group = self.swapped.pop(0)
+                
+                # if the sequence group will be swapped in, swap in its prefix if it is on CPU
+                if seq_group.prefix is not None and seq_group.prefix.on_cpu:
+                    # prefix.on_gpu will be set inside this function
+                    print(f"Swapping in prefix: ", seq_group.prefix.prefix_id)
+                    self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in)
+                    
                 self._swap_in(seq_group, blocks_to_swap_in)
                 self._append_slot(seq_group, blocks_to_copy)
                 num_curr_seqs += num_new_seqs

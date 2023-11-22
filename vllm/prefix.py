@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Union
+from typing import List
 
 # Define the prefix class, which is a collection of prefix (a sequence of tokens).
 # The class contains the following main methods:
@@ -9,12 +9,10 @@ from typing import Dict, List, Optional, Union
 
 
 class Prefix:
-    def __init__(self, prefix_id, token_ids, block_size):
+    def __init__(self, prefix_id, token_ids, block_size, arrival_time):
         self.prefix_id = prefix_id
         self.token_ids = token_ids
         self.length = len(token_ids)
-        print("prefix length: ", self.length)
-        print("block size: ", block_size)
         assert self.length % block_size == 0
         self.on_gpu = False
         self.on_cpu = False
@@ -26,7 +24,11 @@ class Prefix:
         self.freq = 1
         self.alpha = 0.8
         self.beta = 0.5
-    
+
+        # recency related
+        self.arrival_time = arrival_time
+        self.last_accessed_time = arrival_time
+        
     def get_block_table_num(self) -> List[int]:
         return [block.block_number for block in self.block_table]
     
@@ -34,10 +36,16 @@ class Prefix:
         return tokens[:self.length] == self.token_ids
     
     # should be called if the prefix is hit for this iteration
-    def update_freq(self, new_hit_rate):
-        self.freq = self.alpha * self.freq + (1 - self.alpha) * new_hit_rate
-        self.alpha = 0.8
-    
+    # def update_freq(self, new_hit_rate):
+    #     self.freq = self.alpha * self.freq + (1 - self.alpha) * new_hit_rate
+    #     self.alpha = 0.8
+
+    def update_freq(self):
+        self.freq += 1
+        
+    def update_last_accessed_time(self, last_accessed_time):
+        self.last_accessed_time = last_accessed_time
+        
     # should be called if the prefix is not hit for this iteration
     def punish_freq(self):
         self.alpha = self.beta * self.alpha if self.alpha > 0.1 else 0.1
@@ -48,8 +56,7 @@ class Prefix:
     
     def get_length(self):
         return self.length
-
-
+    
 # Define the prefix pool class, which is a collection of prefixes.
 # The class contains the following main methods:
 # 1. add a prefix to the pool, with a computed hash
@@ -65,18 +72,27 @@ class PrefixPool:
         self.prefixes_hash = {}
         self.block_size = block_size
     
-    def add_prefix(self, token_ids: List[int]):
+    def add_prefix(self, token_ids: List[int], arrival_time: float):
         # generate prefix_id
         prefix_id = len(self.prefixes)
         # create a new prefix
-        prefix = Prefix(prefix_id, token_ids, self.block_size)
+        prefix = Prefix(prefix_id, token_ids, self.block_size, arrival_time)
         self.prefixes.append(prefix)
         # @TODO: compute the hash of the prefix
         prefix_hash = hash(tuple(prefix.token_ids))
         # self.prefixes_hash[prefix.prefix_id] = prefix_hash
         self.prefixes_hash[prefix_hash] = prefix.prefix_id
         return prefix
-        
+    
+    def remove_prefix(self, prefix_id: int):
+        # remove the prefix from the pool
+        prefix = self.prefixes[prefix_id]
+        del self.prefixes_hash[hash(tuple(prefix.token_ids))]
+        del self.prefixes[prefix_id]
+    
+    def get_gpu_prefixes(self):
+        return [prefix for prefix in self.prefixes if prefix.on_gpu]
+    
     # @TODO: this one should also come with a method to identify the prefix
     def efficient_search(self, token_ids: List[int]):
         # improve this search
