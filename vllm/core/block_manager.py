@@ -265,7 +265,7 @@ class BlockSpaceManager:
         new_block_table = []
         block_table = prefix.block_table
 
-        for cpu_block in enumerate(block_table):
+        for cpu_block in block_table:
             # ref_count = 1
             gpu_block = self.gpu_allocator.allocate()
             mapping[cpu_block] = gpu_block
@@ -343,10 +343,16 @@ class BlockSpaceManager:
     def _free_block_table(self, block_table: BlockTable) -> None:
         for block in set(block_table):
             if block.device == Device.GPU:
+                # NOTE: do we need to assert here for prefix?
                 self.gpu_allocator.free(block)
             else:
                 self.cpu_allocator.free(block)
 
+    def free_prefix(self, prefix: Prefix) -> None:
+        block_table = prefix.block_table
+        self._free_block_table(block_table)
+        del prefix.block_table
+        
     def free(self, seq: Sequence) -> None:
         if seq.seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.

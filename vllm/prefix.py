@@ -1,4 +1,5 @@
-from typing import List
+from typing import Dict, List, Optional, Union
+import time 
 
 # Define the prefix class, which is a collection of prefix (a sequence of tokens).
 # The class contains the following main methods:
@@ -13,6 +14,8 @@ class Prefix:
         self.prefix_id = prefix_id
         self.token_ids = token_ids
         self.length = len(token_ids)
+        print("prefix length: ", self.length)
+        print("block size: ", block_size)
         assert self.length % block_size == 0
         self.on_gpu = False
         self.on_cpu = False
@@ -82,16 +85,21 @@ class PrefixPool:
         prefix_hash = hash(tuple(prefix.token_ids))
         # self.prefixes_hash[prefix.prefix_id] = prefix_hash
         self.prefixes_hash[prefix_hash] = prefix.prefix_id
+        print(f"Adding prefix ID: {prefix_id}, now has {len(self.prefixes)} prefixes.")
         return prefix
     
-    def remove_prefix(self, prefix_id: int):
+    def remove_prefix(self, prefix: Prefix):
         # remove the prefix from the pool
-        prefix = self.prefixes[prefix_id]
+        # print(f"Before remove, has {len(self.prefixes)} prefixes.")
+        self.prefixes.remove(prefix)
         del self.prefixes_hash[hash(tuple(prefix.token_ids))]
-        del self.prefixes[prefix_id]
+        print(f"Removing prefix ID: {prefix.prefix_id}, now has {len(self.prefixes)} prefixes.")
     
     def get_gpu_prefixes(self):
         return [prefix for prefix in self.prefixes if prefix.on_gpu]
+    
+    def get_cpu_prefixes(self):
+        return [prefix for prefix in self.prefixes if prefix.on_cpu]
     
     # @TODO: this one should also come with a method to identify the prefix
     def efficient_search(self, token_ids: List[int]):
