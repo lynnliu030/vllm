@@ -280,10 +280,13 @@ class LLMEngine:
                 if prefix is not None:
                     seq.prefix = prefix
                     # print("prefix status: ", "on gpu" if prefix.get_status() else "on cpu")
-                    # prefix.update_freq(1.0)
+                    
+                    # Update cache related policy 
+                    prefix.update_freq()
+                    prefix.update_last_accessed_time(arrival_time)
                 else:
                     # create a new prefix
-                    seq.prefix = self.scheduler.prefix_pool.add_prefix(truncated_prefix_token_ids)
+                    seq.prefix = self.scheduler.prefix_pool.add_prefix(truncated_prefix_token_ids, arrival_time)
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
