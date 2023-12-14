@@ -127,16 +127,20 @@ class Scheduler:
         return len(self.waiting) + len(self.running) + len(self.swapped)
 
     def evict_gpu_prefix(self, current_time: float, blocks_to_swap_out: Dict[int, int]):
-        candidate_prefixes = [prefix for prefix in self.running_prefixes if all(block.ref_count == 1 for block in prefix.block_table)]
-        print(f"Number of running prefix before eviction: {len(self.running_prefixes)}, candidate prefixes: {len(candidate_prefixes)}")
+        # candidate_prefixes = [prefix for prefix in self.running_prefixes if all(block.ref_count == 1 for block in prefix.block_table)]
+        # print(f"Number of running prefix before eviction: {len(self.running_prefixes)}, candidate prefixes: {len(candidate_prefixes)}")
         
-        if candidate_prefixes:
-            sorted_prefixes = self.prefix_policy.sort_by_priority(current_time, candidate_prefixes)  
-            victim_prefix = sorted_prefixes.pop(-1)
-            print(f"Swapping out prefix: ", victim_prefix.prefix_id) 
-            self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
-            self.running_prefixes.remove(victim_prefix)
-            print(f"Number of running prefixes after eviction: {len(self.running_prefixes)}, total number of prefix: {len(self.prefix_pool.prefixes)}")  
+        if self.running_prefixes:
+            sorted_prefixes = self.prefix_policy.sort_by_priority(current_time, self.running_prefixes)  
+            
+            victim_prefix = sorted_prefixes[-1]
+            ref_count = sum([gpu_block.ref_count for gpu_block in victim_prefix.block_table])
+            if ref_count == len(victim_prefix.block_table):
+                victim_prefix = sorted_prefixes.pop(-1)
+                print(f"Swapping out prefix: ", victim_prefix.prefix_id) 
+                self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
+                self.running_prefixes.remove(victim_prefix)
+                print(f"Number of running prefixes after eviction: {len(self.running_prefixes)}, total number of prefix: {len(self.prefix_pool.prefixes)}")  
 
     def evict_cpu_prefix(self) -> None:
         # Free the CPU prefix with the lowest priority

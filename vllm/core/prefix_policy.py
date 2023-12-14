@@ -30,6 +30,9 @@ class FCFS(PrefixPolicy):
         now: float,
         prefix: Prefix,
     ) -> float:
+        for gpu_block in prefix.block_table:
+            if gpu_block.ref_count > 1:
+                return float('-inf')
         return now - prefix.arrival_time
 
 
@@ -40,6 +43,9 @@ class LRU(PrefixPolicy):
         now: float, 
         prefix: Prefix 
     ) -> float:
+        for gpu_block in prefix.block_table:
+            if gpu_block.ref_count > 1:
+                return float('-inf')
         return prefix.last_accessed_time
 
 
@@ -50,6 +56,9 @@ class LFU(PrefixPolicy):
         now: float, 
         prefix: Prefix
     ) -> float:
+        for gpu_block in prefix.block_table:
+            if gpu_block.ref_count > 1:
+                return float('-inf')
         return prefix.freq 
 
     
