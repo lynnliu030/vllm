@@ -125,32 +125,6 @@ class Scheduler:
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
-
-    def evict_gpu_prefix(self, current_time: float, blocks_to_swap_out: Dict[int, int]):
-        # candidate_prefixes = [prefix for prefix in self.running_prefixes if all(block.ref_count == 1 for block in prefix.block_table)]
-        # print(f"Number of running prefix before eviction: {len(self.running_prefixes)}, candidate prefixes: {len(candidate_prefixes)}")
-        
-        if self.running_prefixes:
-            sorted_prefixes = self.prefix_policy.sort_by_priority(current_time, self.running_prefixes)  
-            
-            victim_prefix = sorted_prefixes[-1]
-            ref_count = sum([gpu_block.ref_count for gpu_block in victim_prefix.block_table])
-            if ref_count == len(victim_prefix.block_table):
-                victim_prefix = sorted_prefixes.pop(-1)
-                print(f"Swapping out prefix: ", victim_prefix.prefix_id) 
-                self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
-                self.running_prefixes.remove(victim_prefix)
-                print(f"Number of running prefixes after eviction: {len(self.running_prefixes)}, total number of prefix: {len(self.prefix_pool.prefixes)}")  
-
-    def evict_cpu_prefix(self) -> None:
-        # Free the CPU prefix with the lowest priority
-        cpu_prefixes = self.prefix_pool.get_cpu_prefixes()
-        if cpu_prefixes: 
-            eviction_candidates = self.prefix_policy.sort_by_priority(time.monotonic(), cpu_prefixes)
-            eviction_prefix = eviction_candidates.pop(-1)
-            # print(f"Freeing prefix from CPU: {eviction_prefix}")
-            self.block_manager.free_prefix(eviction_prefix)
-            self.prefix_pool.reset_prefix(eviction_prefix)
              
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swaped or copied before model execution.
@@ -161,7 +135,7 @@ class Scheduler:
         # Fix the current time.
         now = time.monotonic()
         self.running_prefixes = self.prefix_pool.get_gpu_prefixes()
-                    
+            
         # Join waiting sequences if possible.
         if not self.swapped:
             ignored_seq_groups: List[SequenceGroup] = []
@@ -222,7 +196,7 @@ class Scheduler:
                     if seq_group.prefix.on_cpu: 
                         assert seq_group.prefix.on_gpu == False
                         print(f"Swapping in prefix: ", seq_group.prefix.prefix_id)
-                        self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in, blocks_to_swap_out)
+                        self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in, blocks_to_swap_out, now)
                         self.running_prefixes.append(seq_group.prefix)
                         
                     seq_group.prefix.update_last_accessed_time(now)
@@ -313,10 +287,11 @@ class Scheduler:
                 self.running.append(seq_group)
         
         # Prefix eviction
-        # 1) When space is full 
-        # 2) When prefix needs to be swapped in but not able to 
+        # 1) When space is full (proactive)
+        # 2) When prefix needs to be swapped in but not able to (reactive)
+        # NOTE: the following is not correctly enforced, need to have some way to move it around 
         if self.prefix_pool.get_total_gpu_blocks() > self.prefix_pool.max_gpu_blocks:
-            print(f"number of GPU blocks: {self.prefix_pool.get_total_gpu_blocks()}, max blocks: {self.prefix_pool.max_gpu_blocks}", flush=True)
+            print(f"prefix space is full - number of prefix GPU blocks: {self.prefix_pool.get_total_gpu_blocks()}, max blocks: {self.prefix_pool.max_gpu_blocks}", flush=True)
             self.evict_gpu_prefix(time.monotonic(), blocks_to_swap_out)
             
         # Each sequence in the generation phase only takes one token slot.
@@ -472,17 +447,41 @@ class Scheduler:
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
 
+    def evict_gpu_prefix(self, current_time: float, blocks_to_swap_out: Dict[int, int]):
+        if self.running_prefixes:
+            sorted_prefixes = self.prefix_policy.sort_by_priority(current_time, self.running_prefixes)  
             
+            victim_prefix = sorted_prefixes[-1]
+            ref_count = sum([gpu_block.ref_count for gpu_block in victim_prefix.block_table])
+            if ref_count == len(victim_prefix.block_table):
+                victim_prefix = sorted_prefixes.pop(-1)
+                print(f"Swapping out prefix from GPU: ", victim_prefix.prefix_id) 
+                self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
+                self.running_prefixes.remove(victim_prefix)
+                print(f"Number of running prefixes after eviction: {len(self.running_prefixes)}, total number of prefix: {len(self.prefix_pool.prefixes)}")  
+                print(f"Number of GPU blocks used by the prefix pool now: {self.prefix_pool.get_total_gpu_blocks()}")
+
+    def evict_cpu_prefix(self) -> None:
+        # Free the CPU prefix with the lowest priority
+        cpu_prefixes = self.prefix_pool.get_cpu_prefixes()
+        if cpu_prefixes: 
+            eviction_candidates = self.prefix_policy.sort_by_priority(time.monotonic(), cpu_prefixes)
+            eviction_prefix = eviction_candidates.pop(-1)
+            # print(f"Freeing prefix from CPU: {eviction_prefix}")
+            self.block_manager.free_prefix(eviction_prefix)
+            self.prefix_pool.reset_prefix(eviction_prefix)
+                   
     def _swap_in_prefix(
         self,
         prefix: Prefix,
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
+        current_time: float
     ) -> None:
         # Evict until there is enough space for the prefix to be swapped in
         while not self.block_manager.can_swap_in_prefix(prefix):
             print("Cannot swap in prefix...")
-            self.evict_gpu_prefix(blocks_to_swap_out)
+            self.evict_gpu_prefix(current_time, blocks_to_swap_out)
             
         mapping = self.block_manager.swap_in_prefix(prefix)
         blocks_to_swap_in.update(mapping)

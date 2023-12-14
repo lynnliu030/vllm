@@ -93,6 +93,9 @@ class PrefixPool:
     def get_total_gpu_blocks(self):
         return sum(prefix.get_length() // self.block_size for prefix in self.prefixes if prefix.on_gpu)
     
+    def get_num_free_blocks(self):
+        return self.max_gpu_blocks - self.get_total_gpu_blocks()
+    
     def add_prefix(self, token_ids: List[int], arrival_time: float):
         # generate prefix_id
         prefix_id = self.id_counter

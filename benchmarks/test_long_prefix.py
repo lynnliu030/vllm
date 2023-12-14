@@ -123,14 +123,14 @@ def test_prefix_caching(num_prefix, num_samples_per_prefix, prefix_length, input
     print(f"Throughput: {rps:.2f} requests/s, {tps:.2f} tokens/s")
 
 # Test with a large number of unique prefixes
-num_prefix = 5 # Number of unique prefix   
-num_samples_per_prefix = 50 # Number of samples for each unique prefix 
+num_prefix = 50 # Number of unique prefix   
+num_samples_per_prefix = 10 # Number of samples for each unique prefix 
 tot_num_reqs = num_prefix * num_samples_per_prefix # Total number of requests
 print(f"Total number of unique prefixes: {num_prefix}, Total number of requests: {tot_num_reqs}, Number of samples for each unique prefix: {num_samples_per_prefix}")
 
-prefix_length = 300 # Number of tokens in the prefix
-input_length = 305 # Number of tokens in the input NOTE: suffix needs to be greater than 3 
+prefix_length = 400 # Number of tokens in the prefix
+input_length = 405 # Number of tokens in the input NOTE: suffix needs to be greater than 3 
 suffix_length = input_length - prefix_length # Number of tokens in the suffix
 print(f"Prefix length: {prefix_length}, Suffix length: {suffix_length}, Input length: {input_length}")
 
-test_prefix_caching(num_prefix, num_samples_per_prefix, prefix_length, input_length, reorder=False, prefix=False)
+test_prefix_caching(num_prefix, num_samples_per_prefix, prefix_length, input_length, reorder=False)
