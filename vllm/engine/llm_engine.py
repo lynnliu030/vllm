@@ -281,7 +281,8 @@ class LLMEngine:
                     seq.prefix = prefix
                     # print("prefix status: ", "on gpu" if prefix.get_status() else "on cpu")
                     
-                    # Update cache related policy 
+                    # Update cache related policy
+                    # TODO: this is updating in advance not at the eviction time  
                     prefix.update_freq()
                     prefix.update_last_accessed_time(arrival_time)
                 else:
@@ -294,6 +295,7 @@ class LLMEngine:
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
+        print(f"Prefix pool number of GPU blocks: {self.scheduler.prefix_pool.get_total_gpu_blocks()}")
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.

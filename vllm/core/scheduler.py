@@ -81,7 +81,8 @@ class Scheduler:
             num_cpu_blocks=self.cache_config.num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window)
         
-        self.prefix_pool = PrefixPool(self.cache_config.block_size)
+        # Cache size 
+        self.prefix_pool = PrefixPool(self.cache_config.block_size, max_gpu_blocks=self.cache_config.num_gpu_blocks // 4)
 
         # TODO(zhuohan): Use deque instead of list for better performance.
         # Sequence groups in the WAITING state.
@@ -125,6 +126,28 @@ class Scheduler:
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
 
+    def evict_gpu_prefix(self, current_time: float, blocks_to_swap_out: Dict[int, int]):
+        candidate_prefixes = [prefix for prefix in self.running_prefixes if all(block.ref_count == 1 for block in prefix.block_table)]
+        print(f"Number of running prefix before eviction: {len(self.running_prefixes)}, candidate prefixes: {len(candidate_prefixes)}")
+        
+        if candidate_prefixes:
+            sorted_prefixes = self.prefix_policy.sort_by_priority(current_time, candidate_prefixes)  
+            victim_prefix = sorted_prefixes.pop(-1)
+            print(f"Swapping out prefix: ", victim_prefix.prefix_id) 
+            self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
+            self.running_prefixes.remove(victim_prefix)
+            print(f"Number of running prefixes after eviction: {len(self.running_prefixes)}, total number of prefix: {len(self.prefix_pool.prefixes)}")  
+
+    def evict_cpu_prefix(self) -> None:
+        # Free the CPU prefix with the lowest priority
+        cpu_prefixes = self.prefix_pool.get_cpu_prefixes()
+        if cpu_prefixes: 
+            eviction_candidates = self.prefix_policy.sort_by_priority(time.monotonic(), cpu_prefixes)
+            eviction_prefix = eviction_candidates.pop(-1)
+            # print(f"Freeing prefix from CPU: {eviction_prefix}")
+            self.block_manager.free_prefix(eviction_prefix)
+            self.prefix_pool.reset_prefix(eviction_prefix)
+             
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swaped or copied before model execution.
         blocks_to_swap_in: Dict[int, int] = {}
@@ -134,10 +157,6 @@ class Scheduler:
         # Fix the current time.
         now = time.monotonic()
         self.running_prefixes = self.prefix_pool.get_gpu_prefixes()
-        sorted_prefixes = self.prefix_policy.sort_by_priority(now, self.running_prefixes)
-        
-        # prefix_repres = [f"prefix id: {prefix.prefix_id}, prefix_freq: {prefix.freq}, prefix_arrival_time: {prefix.arrival_time}, prefix_last_access_time {prefix.last_accessed_time}" for prefix in sorted_prefixes]
-        # print(f"Sorted GPU prefix in order: {prefix_repres}")
                     
         # Join waiting sequences if possible.
         if not self.swapped:
@@ -171,14 +190,6 @@ class Scheduler:
                 
                 # If the sequence group cannot be allocated, free until stop.
                 if not self.block_manager.can_allocate(seq_group):  
-                    print(f"Sequence group cannot be allocated")
-                    # preempt prefix 
-                    if len(sorted_prefixes) > 0:
-                        victim_prefix = sorted_prefixes.pop(-1)
-                        print(f"Swapping out prefix: ", victim_prefix.prefix_id)  
-                        self._swap_out_prefix(victim_prefix, blocks_to_swap_out)
-                        self.running_prefixes.remove(victim_prefix)
-                        print(f"Number of running prefixes after eviction: {len(self.running_prefixes)}")
                     break 
                 
                 # If the number of batched tokens exceeds the limit, stop.
@@ -201,17 +212,23 @@ class Scheduler:
                 seq_lens = new_seq_lens
 
                 seq_group = self.waiting.pop(0)
-                # swap in the prefix if it is on CPU
-                if seq_group.prefix is not None and seq_group.prefix.on_cpu:
-                    # prefix.on_gpu will be set inside this function
-                    self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in)
-                    self.running_prefixes.append(seq_group.prefix)
-                    
+                
+                if seq_group.prefix is not None:
+                    # swap in prefix if on cpu; prefix.on_gpu will be set inside this function
+                    if seq_group.prefix.on_cpu: 
+                        assert seq_group.prefix.on_gpu == False
+                        print(f"Swapping in prefix: ", seq_group.prefix.prefix_id)
+                        self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in, blocks_to_swap_out)
+                        self.running_prefixes.append(seq_group.prefix)
+                        
+                    seq_group.prefix.update_last_accessed_time(now)
+                        
                 # if the prefix hasn't been compuated, allocate blocks for it and set prefix.swap_to_gpu to True
                 self._allocate(seq_group)
                 self.running.append(seq_group)
                 num_curr_seqs += num_new_seqs
-                scheduled.append(seq_group)
+                scheduled.append(seq_group)                
+                print(f"Number of running prefixes: {len(self.running_prefixes)}, while waiting...")
 
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(
@@ -275,17 +292,29 @@ class Scheduler:
 
                 seq_group = self.swapped.pop(0)
                 
-                # if the sequence group will be swapped in, swap in its prefix if it is on CPU
-                if seq_group.prefix is not None and seq_group.prefix.on_cpu:
-                    # prefix.on_gpu will be set inside this function
-                    print(f"Swapping in prefix: ", seq_group.prefix.prefix_id)
-                    self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in)
-                    
+                if seq_group.prefix is not None:
+                    # if the sequence group will be swapped in, swap in its prefix if it is on CPU
+                    if seq_group.prefix.on_cpu: 
+                        # prefix.on_gpu will be set inside this function
+                        assert seq_group.prefix.on_gpu == False
+                        print(f"Swapping in prefix: ", seq_group.prefix.prefix_id)
+                        self._swap_in_prefix(seq_group.prefix, blocks_to_swap_in)
+                        self.running_prefixes.append(seq_group.prefix)
+                        
+                    seq_group.prefix.update_last_accessed_time(now)
+                
                 self._swap_in(seq_group, blocks_to_swap_in)
                 self._append_slot(seq_group, blocks_to_copy)
                 num_curr_seqs += num_new_seqs
                 self.running.append(seq_group)
-
+        
+        # Prefix eviction
+        # 1) When space is full 
+        # 2) When prefix needs to be swapped in but not able to 
+        if self.prefix_pool.get_total_gpu_blocks() > self.prefix_pool.max_gpu_blocks:
+            print(f"number of GPU blocks: {self.prefix_pool.get_total_gpu_blocks()}, max blocks: {self.prefix_pool.max_gpu_blocks}", flush=True)
+            self.evict_gpu_prefix(time.monotonic(), blocks_to_swap_out)
+            
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
         # sequences in the RUNNING state.
@@ -331,18 +360,6 @@ class Scheduler:
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs
 
-    def free_prefix(self) -> None:
-        # Free the CPU prefix with the lowest priority
-        cpu_prefixes = self.prefix_pool.get_cpu_prefixes()
-        if len(cpu_prefixes) != 0: 
-            eviction_candidates = self.prefix_policy.sort_by_priority(time.monotonic(), cpu_prefixes)
-            # prefix_repres = [f"prefix id: {prefix.prefix_id}, prefix_freq: {prefix.freq}, prefix_arrival_time: {prefix.arrival_time}, prefix_last_access_time {prefix.last_accessed_time}" for prefix in eviction_candidates]
-            # print(f"Sorted CPU prefix in order: {prefix_repres}")
-        
-            eviction_prefix = eviction_candidates.pop(-1)
-            print(f"Freeing prefix from CPU: {eviction_prefix.prefix_id}")
-            self.block_manager.free_prefix(eviction_prefix)
-            self.prefix_pool.remove_prefix(eviction_prefix)
         
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)
@@ -450,33 +467,36 @@ class Scheduler:
         blocks_to_swap_out.update(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
-    
+
+            
     def _swap_in_prefix(
         self,
         prefix: Prefix,
         blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
     ) -> None:
+        # Evict until there is enough space for the prefix to be swapped in
+        while not self.block_manager.can_swap_in_prefix(prefix):
+            print("Cannot swap in prefix...")
+            self.evict_gpu_prefix(blocks_to_swap_out)
+            
         mapping = self.block_manager.swap_in_prefix(prefix)
         blocks_to_swap_in.update(mapping)
         prefix.on_gpu = True
+        prefix.on_cpu = False
 
     def _swap_out_prefix(
         self,
         prefix: Prefix,
         blocks_to_swap_out: Dict[int, int],
     ) -> None:
-        # if not self.block_manager.can_swap_out_prefix(prefix):
-        #     # FIXME(woosuk): Abort the sequence group instead of aborting the
-        #     # entire engine.
-        #     raise RuntimeError(
-        #         "Aborted due to the lack of CPU swap space. Please increase "
-        #         "the swap space to avoid this error.")
-        
+        # evict prefix from CPU if lack of CPU swap space
         while not self.block_manager.can_swap_out_prefix(prefix):
-            # evict prefix from CPU 
-            self.free_prefix()
+            print("Cannot swap in prefix...")
+            self.evict_cpu_prefix()
             
         mapping = self.block_manager.swap_out_prefix(prefix)
         blocks_to_swap_out.update(mapping)
         prefix.on_cpu = True
         prefix.on_gpu = False
+        print(f"Swapping out prefix and set the on gpu to false: ", prefix.prefix_id)

@@ -60,6 +60,17 @@ class Prefix:
     def get_length(self):
         return self.length
     
+    def __repr__(self) -> str:
+        return (f"Prefix("
+                f"prefix_id={self.prefix_id}, "
+                f"length={self.length}, "
+                f"on_gpu={self.on_gpu}, "
+                f"on_cpu={self.on_cpu}, "
+                f"block_table={self.block_table}, "
+                f"freq={self.freq}, "
+                f"arrival_time={self.arrival_time}, "
+                f"last_accessed_time={self.last_accessed_time}, ")
+        
 # Define the prefix pool class, which is a collection of prefixes.
 # The class contains the following main methods:
 # 1. add a prefix to the pool, with a computed hash
@@ -70,12 +81,17 @@ class Prefix:
 
 
 class PrefixPool:
-    def __init__(self, block_size):
+    def __init__(self, block_size, max_gpu_blocks):
         self.prefixes = []
         self.prefixes_hash = {}
         self.block_size = block_size
-        
+
+        self.max_gpu_blocks = max_gpu_blocks
         self.id_counter = 0
+        print(f"Prefix pool initialized, block size: {self.block_size}, max cached blocks: {self.max_gpu_blocks}")
+    
+    def get_total_gpu_blocks(self):
+        return sum(prefix.get_length() // self.block_size for prefix in self.prefixes if prefix.on_gpu)
     
     def add_prefix(self, token_ids: List[int], arrival_time: float):
         # generate prefix_id
@@ -91,10 +107,18 @@ class PrefixPool:
         self.prefixes_hash[prefix_hash] = prefix.prefix_id
         print(f"Adding prefix ID: {prefix_id}, now has {len(self.prefixes)} prefixes.")
         return prefix
-    
+
+    def reset_prefix(self, prefix: Prefix):
+        prefix.on_cpu = False
+        prefix.on_gpu = False
+        prefix.swap_to_gpu = False
+        prefix.freq = 0 
+        prefix.arrival_time = None 
+        prefix.last_accessed_time = None
+        
     def remove_prefix(self, prefix: Prefix):
         # remove the prefix from the pool
-        # print(f"Before remove, has {len(self.prefixes)} prefixes.")
+        print(f"Before remove, has {len(self.prefixes)} prefixes.")
         self.prefixes.remove(prefix)
         del self.prefixes_hash[hash(tuple(prefix.token_ids))]
         print(f"Removing prefix ID: {prefix.prefix_id}, now has {len(self.prefixes)} prefixes.")
@@ -117,7 +141,6 @@ class PrefixPool:
     def fixed_search(self, prefix_hash):
         if prefix_hash not in self.prefixes_hash:
             return None
-        # print("Found prefix in the pool.")
+        print("Found prefix in the pool.")
         prefix_id = self.prefixes_hash[prefix_hash]
         return self.prefixes[prefix_id]
-

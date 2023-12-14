@@ -126,6 +126,7 @@ class BlockSpaceManager:
                     
             # allocate blocks for the prefix, we need to calculate the prefix's kv in this run
             elif not seq_group.prefix.swap_to_gpu:
+                # no other seq is calculating 
                 num_prefix_blocks = seq_group.prefix.get_length() // self.block_size
                 seq_group.prefix.swap_to_gpu = True
 
@@ -351,7 +352,7 @@ class BlockSpaceManager:
     def free_prefix(self, prefix: Prefix) -> None:
         block_table = prefix.block_table
         self._free_block_table(block_table)
-        del prefix.block_table
+        prefix.block_table = None 
         
     def free(self, seq: Sequence) -> None:
         if seq.seq_id not in self.block_tables:
