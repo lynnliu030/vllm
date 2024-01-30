@@ -61,5 +61,5 @@ def test_prefix_caching(num_tests):
     print(f"Throughput: {rps:.2f} requests/s, {tps:.2f} tokens/s")
 
 # Test with a large number of unique prefixes
-num_tests = 10000  # Adjust this number based on your testing needs
+num_tests = 100  # Adjust this number based on your testing needs
 test_prefix_caching(num_tests)

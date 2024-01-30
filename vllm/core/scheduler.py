@@ -166,8 +166,8 @@ class Scheduler:
                     self.waiting.pop(0)
                     continue
                 
-                # If the sequence group cannot be allocated, free until stop.
                 if not self.block_manager.can_allocate(seq_group):  
+                    # TODO: If the sequence group cannot be allocated, free prefixes until stop?
                     break 
                 
                 # If the number of batched tokens exceeds the limit, stop.
@@ -191,6 +191,7 @@ class Scheduler:
 
                 seq_group = self.waiting.pop(0)
                 
+                # Swap-in logic for prefix
                 if seq_group.prefix is not None:
                     # swap in prefix if on cpu; prefix.on_gpu will be set inside this function
                     if seq_group.prefix.on_cpu: 
@@ -206,7 +207,7 @@ class Scheduler:
                 self.running.append(seq_group)
                 num_curr_seqs += num_new_seqs
                 scheduled.append(seq_group)                
-                print(f"Number of running prefixes: {len(self.running_prefixes)}, while waiting...")
+                # print(f"Number of running prefixes: {len(self.running_prefixes)}, while waiting...")
 
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(

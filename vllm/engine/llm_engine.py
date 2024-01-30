@@ -295,7 +295,7 @@ class LLMEngine:
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
-        print(f"Prefix pool number of GPU blocks: {self.scheduler.prefix_pool.get_total_gpu_blocks()}")
+        # print(f"Prefix pool number of GPU blocks: {self.scheduler.prefix_pool.get_total_gpu_blocks()}")
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
