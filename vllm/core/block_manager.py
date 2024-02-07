@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from vllm.block import BlockTable, PhysicalTokenBlock
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
-
+from vllm.prefix import Prefix
 
 class BlockAllocator:
     """Manages free physical token blocks for a device.
@@ -48,7 +48,7 @@ class BlockAllocator:
             self.free_blocks.append(block)
 
     def get_num_free_blocks(self) -> int:
-        return len(self.free_blocks)
+        return len(self.free_blocks) 
 
 
 class AllocStatus(enum.Enum):
@@ -97,28 +97,35 @@ class BlockSpaceManager:
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
-    def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
-        # FIXME(woosuk): Here we assume that all sequences in the group share
-        # the same prompt. This may not be true for preempted sequences.
+    def num_required_blocks(self, seq_group: SequenceGroup) -> int:
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
         num_required_blocks = len(seq.logical_token_blocks)
+        print(f"Total number of required blocks: {num_required_blocks}")
 
         if seq_group.prefix is not None and seq_group.prefix.allocated:
+            print(f"Prefix {seq_group.prefix.hash} has already been allocated")
             num_required_blocks -= seq_group.prefix.get_num_blocks()
 
         if self.block_sliding_window is not None:
             num_required_blocks = min(num_required_blocks,
                                       self.block_sliding_window)
+        return num_required_blocks
+    
+    def can_allocate(self, seq_group: SequenceGroup) -> Tuple[AllocStatus, int]:
+        # FIXME(woosuk): Here we assume that all sequences in the group share
+        # the same prompt. This may not be true for preempted sequences.
+        num_required_blocks = self.num_required_blocks(seq_group)
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
 
+        print(f"Number of required blocks: {num_required_blocks}, Number of free GPU blocks: {num_free_gpu_blocks}, Watermark blocks: {self.watermark_blocks}")
         # Use watermark to avoid frequent cache eviction.
         if (self.num_total_gpu_blocks - num_required_blocks <
                 self.watermark_blocks):
-            return AllocStatus.NEVER
+            return AllocStatus.NEVER, 0
         if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
-            return AllocStatus.OK
+            return AllocStatus.OK, 0
         else:
-            return AllocStatus.LATER
+            return AllocStatus.LATER, self.watermark_blocks - (num_free_gpu_blocks - num_required_blocks)
 
     def allocate(self, seq_group: SequenceGroup) -> None:
         # NOTE: Here we assume that all sequences in the group have the same
@@ -134,8 +141,10 @@ class BlockSpaceManager:
 
         prefix = seq_group.prefix
         if prefix is not None and prefix.allocated:
+            print(f"Locate prefix {prefix.hash}, has already allocated, and computed or not? {prefix.computed}")
             # Prefix has already been allocated. Use the existing block table.
             num_prompt_blocks -= prefix.get_num_blocks()
+            prefix.ref_count += seq_group.num_seqs()    
             for block in prefix.block_table:
                 block.ref_count += seq_group.num_seqs()
                 block_table.append(block)
@@ -151,10 +160,12 @@ class BlockSpaceManager:
             block_table.append(block)
 
         if prefix is not None and not prefix.allocated:
+            print(f"Allocating prefix {prefix.hash} now")
             # Allocate blocks for the prefix, we will compute the prefix's
             # KV cache in this run.
             num_prefix_blocks = prefix.get_num_blocks()
             prefix_block_table = block_table[:num_prefix_blocks]
+            prefix.ref_count += 1 
             for block in prefix_block_table:
                 block.ref_count += 1
             prefix.set_block_table(prefix_block_table)
@@ -163,6 +174,8 @@ class BlockSpaceManager:
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             self.block_tables[seq.seq_id] = block_table.copy()
 
+        
+        
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
         # Simple heuristic: If there is at least one free block
         # for each sequence, we can append.
@@ -242,6 +255,7 @@ class BlockSpaceManager:
             new_block_table: BlockTable = []
             block_table = self.block_tables[seq.seq_id]
             if seq_group.prefix is not None:
+                seq_group.prefix.ref_count += 1
                 for block in seq_group.prefix.block_table:
                     new_block_table.append(block)
                     block.ref_count += 1
@@ -280,6 +294,7 @@ class BlockSpaceManager:
                         and gpu_block in seq_group.prefix.block_table):
                     # NOTE: We do not swap out the prefix blocks for now.
                     self.gpu_allocator.free(gpu_block)
+                    seq.prefix.ref_count -= 1
                     continue
 
                 if gpu_block in mapping:
@@ -306,12 +321,28 @@ class BlockSpaceManager:
             else:
                 self.cpu_allocator.free(block)
 
+    # TODO: parallel evict on prefix not needed anymore 
+    def free_prefix(self, prefix: Prefix) -> None:
+        assert prefix.ref_count == 0
+        print("Before freeing prefix, number of GPU free blocks: ", self.gpu_allocator.get_num_free_blocks())
+        # reference count on the prefix 
+        ref_count = sum([gpu_block.ref_count for gpu_block in prefix.block_table])
+        print(f" -- evicting prefix {prefix.hash} with ref count {ref_count}, and length of blocks {len(prefix.block_table)}")
+        block_table = prefix.block_table
+        self._free_block_table(block_table)
+        prefix.block_table = None 
+        print("After freeing prefix, number of GPU free blocks: ", self.gpu_allocator.get_num_free_blocks())
+        
     def free(self, seq: Sequence) -> None:
         if seq.seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.
             return
         block_table = self.block_tables[seq.seq_id]
         self._free_block_table(block_table)
+        
+        if seq.prefix is not None: 
+            seq.prefix.ref_count -= 1
+        
         del self.block_tables[seq.seq_id]
 
     def reset(self) -> None:

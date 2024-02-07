@@ -399,7 +399,7 @@ class LLMEngine:
 
         # Check whether the input specifies prefix
         prefix = self.scheduler.prefix_pool.add_or_get_prefix(
-            prompt_token_ids[:prefix_pos]) if prefix_pos is not None else None
+            prompt_token_ids[:prefix_pos], arrival_time) if prefix_pos is not None else None
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,

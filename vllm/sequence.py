@@ -131,6 +131,7 @@ class Sequence:
         # Used for incremental detokenization
         self.prefix_offset = 0
         self.read_offset = 0
+        self.prefix = None  # hack prefix here
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
 

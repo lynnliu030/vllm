@@ -184,3 +184,14 @@ _build/
 
 # Benchmark dataset
 *.json
+
+batch_*
+no_*
+reorder_*
+test_*
+test*
+sglang*
+save*
+result*
+larger_*
+raw*

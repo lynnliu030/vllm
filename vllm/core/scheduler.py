@@ -9,10 +9,11 @@ from vllm.core.policy import PolicyFactory
 from vllm.logger import init_logger
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceStatus)
-from vllm.prefix import PrefixPool
+from vllm.prefix import PrefixPool, Prefix
+from vllm.core.prefix_policy import PrefixPolicyFactory
 
 logger = init_logger(__name__)
-
+ 
 
 class PreemptionMode(enum.Enum):
     """Preemption modes.
@@ -78,7 +79,8 @@ class Scheduler:
             sliding_window=self.cache_config.sliding_window)
 
         # Create the prefix pool to cache the prefixes.
-        self.prefix_pool = PrefixPool(self.cache_config.block_size)
+        self.prefix_policy = PrefixPolicyFactory.get_policy(policy_name="lru")
+        self.prefix_pool = PrefixPool(self.cache_config.block_size, self.cache_config.num_gpu_blocks // 2)
 
         # Sequence groups in the WAITING state.
         self.waiting: Deque[SequenceGroup] = deque()
@@ -86,6 +88,9 @@ class Scheduler:
         self.running: Deque[SequenceGroup] = deque()
         # Sequence groups in the SWAPPED state.
         self.swapped: Deque[SequenceGroup] = deque()
+        
+        # Prefixes 
+        self.running_prefixes: List[Prefix] = []
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
@@ -132,16 +137,20 @@ class Scheduler:
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
-
+                
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swaped or copied before model execution.
         blocks_to_swap_in: Dict[int, int] = {}
         blocks_to_swap_out: Dict[int, int] = {}
         blocks_to_copy: Dict[int, List[int]] = {}
+        print("_schedule runs")
 
         # Fix the current time.
         now = time.monotonic()
 
+        # Get running prefixes 
+        self.running_prefixes = self.prefix_pool.get_running_prefixes()
+        
         # Join waiting sequences if possible.
         if not self.swapped:
             ignored_seq_groups: List[SequenceGroup] = []
@@ -175,9 +184,38 @@ class Scheduler:
                     continue
 
                 # If the sequence group cannot be allocated, stop.
-                can_allocate = self.block_manager.can_allocate(seq_group)
+                can_allocate, required_size = self.block_manager.can_allocate(seq_group)
                 if can_allocate == AllocStatus.LATER:
-                    break
+                    # NOTE: so here shall we break?? 
+                    # NOTE 1: Reactive Prefix Caching: Evict Only When No Space 
+                    print(f"Can allocate later, stop")
+                    # Check if we need to free up prefix blocks to allocate the sequence group.
+                    evict_bytes = 0 
+                    
+                    # eviction candidates are those which ref count is equal to the number of blocks, and not the current sequence group prefix
+                    eviction_candidates = [prefix for prefix in self.running_prefixes if prefix != seq_group.prefix and prefix.ref_count < 1]
+                    
+                    if eviction_candidates:
+                        print(f"Eviction candidates: {eviction_candidates}")
+                    
+                        eviction_candidates = self.prefix_policy.sort_by_priority(time.monotonic(), eviction_candidates)
+                            
+                        while eviction_candidates and evict_bytes < required_size:
+                            # Preempt prefix first 
+                            # Evict prefix until we can allocate the sequence group.
+                            eviction_prefix = eviction_candidates.pop(-1)
+                            # NOTE: Do I need to check reference count here?   
+                            self.block_manager.free_prefix(eviction_prefix)  
+                            self.prefix_pool.reset_prefix(eviction_prefix)
+                            self.running_prefixes.remove(eviction_prefix)
+                            
+                            evict_bytes += eviction_prefix.get_length()
+                            print(f"Evicting prefix {eviction_prefix}")
+        
+                    else: 
+                        print(f"Quit because of later")       
+                        break 
+                
                 elif can_allocate == AllocStatus.NEVER:
                     logger.warning(
                         f"Input prompt ({num_prompt_tokens} tokens) is too long"
@@ -193,6 +231,7 @@ class Scheduler:
                 num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
                 if (num_batched_tokens >
                         self.scheduler_config.max_num_batched_tokens):
+                    print(f"Quit because of max num batched tokens")
                     break
 
                 # The total number of sequences in the RUNNING state should not
@@ -200,20 +239,30 @@ class Scheduler:
                 num_new_seqs = seq_group.get_max_num_running_seqs()
                 if (num_curr_seqs + num_new_seqs >
                         self.scheduler_config.max_num_seqs):
+                    print(f"Quit because of max num seqs")
                     break
 
                 num_paddings = num_batched_tokens - sum(new_seq_lens)
                 if num_paddings > self.scheduler_config.max_paddings:
+                    print(f"Quit because of max paddings")
                     break
                 seq_lens = new_seq_lens
 
                 seq_group = self.waiting.popleft()
+                
+                # Update metadata for prefix
+                if seq_group.prefix is not None:
+                    seq_group.prefix.update_freq()
+                    seq_group.prefix.update_last_accessed_time(now)
+                    
                 self._allocate(seq_group)
+                print(f"Allocated sequence group {seq_group.request_id}")
                 self.running.append(seq_group)
                 num_curr_seqs += num_new_seqs
                 scheduled.append(seq_group)
 
             if scheduled or ignored_seq_groups:
+                print(f"Scheduler batch size {len(scheduled)}")
                 scheduler_outputs = SchedulerOutputs(
                     scheduled_seq_groups=scheduled,
                     prompt_run=True,
@@ -232,6 +281,8 @@ class Scheduler:
         # groups to preempt.
         self.running = self.policy.sort_by_priority(now, self.running)
 
+        print(f"Number of running sequence groups: {len(self.running)}")
+        print(f"Number of running prefixes: {len(self.running_prefixes)}")
         # Reserve new token slots for the running sequence groups.
         running: Deque[SequenceGroup] = deque()
         preempted: List[SequenceGroup] = []
@@ -240,6 +291,7 @@ class Scheduler:
             while not self.block_manager.can_append_slot(seq_group):
                 if self.running:
                     # Preempt the lowest-priority sequence groups.
+                    print(f"Preempting the lowest-priority sequence group")
                     victim_seq_group = self.running.pop()
                     self._preempt(victim_seq_group, blocks_to_swap_out)
                     preempted.append(victim_seq_group)
@@ -257,6 +309,7 @@ class Scheduler:
 
         # Swap in the sequence groups in the SWAPPED state if possible.
         self.swapped = self.policy.sort_by_priority(now, self.swapped)
+        print(f"Number of swapped sequence groups: {len(self.swapped)}")
         if not preempted:
             num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
                                 for seq_group in self.running)
@@ -275,11 +328,16 @@ class Scheduler:
                     break
 
                 seq_group = self.swapped.popleft()
+                
+                if seq_group.prefix is not None:
+                    seq_group.prefix.update_freq()
+                    seq_group.prefix.update_last_accessed_time(now)
+                    
                 self._swap_in(seq_group, blocks_to_swap_in)
                 self._append_slot(seq_group, blocks_to_copy)
                 num_curr_seqs += num_new_seqs
                 self.running.append(seq_group)
-
+        
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
         # sequences in the RUNNING state.
@@ -296,6 +354,7 @@ class Scheduler:
             blocks_to_copy=blocks_to_copy,
             ignored_seq_groups=[],
         )
+        # print(f"Running scheduler batch size: {len(self.running)}")
         return scheduler_outputs
 
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
@@ -339,6 +398,7 @@ class Scheduler:
         self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
+            seq.prefix = seq_group.prefix
 
     def _append_slot(
         self,
@@ -373,6 +433,7 @@ class Scheduler:
         # sequences. This may require a more sophisticated CUDA kernel.
         if preemption_mode is None:
             if seq_group.get_max_num_running_seqs() == 1:
+                print(f"Preempting by recompute")
                 preemption_mode = PreemptionMode.RECOMPUTE
             else:
                 preemption_mode = PreemptionMode.SWAP
@@ -411,6 +472,7 @@ class Scheduler:
     ) -> None:
         mapping = self.block_manager.swap_in(seq_group)
         blocks_to_swap_in.update(mapping)
+        print(f"Swapping in sequence group")
         for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
             seq.status = SequenceStatus.RUNNING
 

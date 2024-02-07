@@ -19,6 +19,7 @@ class Prefix:
         self,
         token_ids: Sequence[int],
         block_size: int,
+        arrival_time: Optional[float] = None,
     ) -> None:
         self.token_ids = tuple(token_ids)
         self.block_size = block_size
@@ -27,6 +28,13 @@ class Prefix:
         assert self.length % block_size == 0
         self.block_table: Optional[BlockTable] = None
         self.computed = False
+        
+        self.ref_count: Optional[int] = 0
+        
+        # Policy decisions 
+        self.arrival_time = arrival_time
+        self.last_accessed_time = arrival_time
+        self.freq = 0
 
     @property
     def allocated(self) -> bool:
@@ -46,8 +54,23 @@ class Prefix:
 
     def set_block_table(self, block_table: BlockTable) -> None:
         self.block_table = block_table.copy()
-
-
+        
+    def update_freq(self):
+        self.freq += 1
+        
+    def update_last_accessed_time(self, last_accessed_time):
+        self.last_accessed_time = last_accessed_time
+    
+    def __repr__(self) -> str:
+        return (f"Prefix("
+                f"prefix_id={self.hash}, "
+                f"length={self.length}, "
+                f"computed={self.computed}, "
+                f"block_table={self.block_table}, "
+                f"freq={self.freq}, "
+                f"arrival_time={self.arrival_time}, "
+                f"last_accessed_time={self.last_accessed_time}, ")
+        
 class PrefixPool:
     """Manages all the prompt prefixes.
 
@@ -65,22 +88,42 @@ class PrefixPool:
     def __init__(
         self,
         block_size: int,
+        max_gpu_blocks: int,
     ) -> None:
         # TODO(zhuohan): Add a capacity limit to the prefix pool.
         self.prefixes: Dict[int, Prefix] = {}
         self.block_size = block_size
-
+        
+        self.max_gpu_blocks = max_gpu_blocks
+    
+    def get_total_gpu_blocks(self):
+        return sum(prefix.get_length() // self.block_size for prefix in self.prefixes.values() if prefix.computed)
+    
     def _truncate_token_ids(self, token_ids: Sequence[int]) -> Tuple[int]:
         new_length = len(token_ids) // self.block_size * self.block_size
         return tuple(token_ids[:new_length])
 
-    def add_or_get_prefix(self, token_ids: Sequence[int]) -> Optional[Prefix]:
+    def get_running_prefixes(self) -> List[Prefix]:
+        return [prefix for prefix in self.prefixes.values() if prefix.computed]
+    
+    def add_or_get_prefix(self, token_ids: Sequence[int], arrival_time: float) -> Optional[Prefix]:
         token_ids = self._truncate_token_ids(token_ids)
         if len(token_ids) == 0:
             # Prefix is empty.
             return None
-        prefix = Prefix(token_ids, self.block_size)
+        prefix = Prefix(token_ids, self.block_size, arrival_time=arrival_time)
         prefix_hash = hash(prefix)
         if prefix_hash not in self.prefixes:
             self.prefixes[prefix_hash] = prefix
         return self.prefixes[prefix_hash]
+
+    def reset_prefix(self, prefix: Prefix) -> None:
+        prefix.computed = False
+        prefix.freq = 0 
+        prefix.arrival_time = None 
+        prefix.last_accessed_time = None
+        
+    def remove_prefix(self, prefix: Prefix) -> None:
+        print(f"Before remove, has {len(self.prefixes)} prefixes.")
+        del self.prefixes[hash(prefix)]
+        print(f"Removing prefix ID: {prefix.hash}, now has {len(self.prefixes)} prefixes.")
